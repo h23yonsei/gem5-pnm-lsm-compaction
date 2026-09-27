@@ -1,0 +1,419 @@
+diff --git a/.gitignore b/.gitignore
+index 6f383a1..b2a359e 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,6 +2,7 @@ MODULE.bazel.lock
+ bazel-*
+ build
+ gem5_build
++disk_images/
+ parser.out
+ parsetab.py
+ cscope.files
+@@ -10,7 +11,6 @@ cscope.out
+ *~
+ .*.swp
+ .*.swo
+-m5out
+ /src/doxygen/html
+ /docs/_build
+ /ext/dramsim2/DRAMSim2
+@@ -38,3 +38,4 @@ configs/dram/lowp_sweep.cfg
+ .vscode
+ typings
+ .DS_Store
++core
+diff --git a/src/mem/bridge.cc b/src/mem/bridge.cc
+index 5c303f9..f76d646 100644
+--- a/src/mem/bridge.cc
++++ b/src/mem/bridge.cc
+@@ -132,6 +132,20 @@ BridgeBase::BridgeRequestPort::recvTimingResp(PacketPtr pkt)
+ 
+     DPRINTF(Bridge, "Request queue size: %d\n", transmitList.size());
+ 
++    // Some X86 IO devices fail to call makeAtomicResponse() in their
++    // timing path, delivering a request packet here instead of a response.
++    // Convert it so trySendTiming() can send it without asserting.
++    // makeResponse() asserts isRequest() && needsResponse() — guard both.
++    // Packets that are neither convertible nor responses are discarded.
++    if (!pkt->isResponse()) {
++        if (pkt->isRequest() && pkt->needsResponse()) {
++            pkt->makeResponse();
++        } else {
++            delete pkt;
++            return true;
++        }
++    }
++
+     // technically the packet only reaches us after the header delay,
+     // and typically we also need to deserialise any payload (unless
+     // the two sides of the bridge are synchronous)
+@@ -293,6 +307,33 @@ BridgeBase::BridgeResponsePort::trySendTiming()
+ 
+     PacketPtr pkt = resp.pkt;
+ 
++    // Defensive: some X86 IO devices fail to call makeAtomicResponse(),
++    // delivering a request into the response queue.  Convert it here so
++    // sendTimingResp() doesn't assert pkt->isResponse().
++    // makeResponse() internally asserts needsResponse() && isRequest(), so
++    // guard both conditions.  If the packet cannot be converted, dequeue
++    // and discard rather than crashing.
++    if (!pkt->isResponse()) {
++        if (pkt->isRequest() && pkt->needsResponse()) {
++            pkt->makeResponse();
++        } else {
++            // Non-convertible orphan — discard without sending
++            transmitList.pop_front();
++            assert(outstandingResponses != 0);
++            --outstandingResponses;
++            if (!transmitList.empty()) {
++                bridge.schedule(sendEvent,
++                    std::max(transmitList.front().tick, bridge.clockEdge()));
++            }
++            if (!memSidePort.reqQueueFull() && retryReq) {
++                retryReq = false;
++                sendRetryReq();
++            }
++            delete pkt;
++            return;
++        }
++    }
++
+     DPRINTF(Bridge, "trySend response addr 0x%x, outstanding %d\n",
+             pkt->getAddr(), outstandingResponses);
+ 
+diff --git a/src/mem/cache/base.cc b/src/mem/cache/base.cc
+index f6563e1..c27f7ce 100644
+--- a/src/mem/cache/base.cc
++++ b/src/mem/cache/base.cc
+@@ -464,11 +464,20 @@ BaseCache::recvTimingReq(PacketPtr pkt)
+         // write will succeed.  LockedRMWReadReq brings the block in in
+         // exclusive mode, so we know it was previously writable.
+         CacheBlk *blk = tags->findBlock({pkt->getAddr(), pkt->isSecure()});
+-        assert(blk && blk->isValid());
+-        assert(!blk->isSet(CacheBlk::WritableBit) &&
+-               !blk->isSet(CacheBlk::ReadableBit));
+-        blk->setCoherenceBits(CacheBlk::ReadableBit);
+-        blk->setCoherenceBits(CacheBlk::WritableBit);
++        if (blk && blk->isValid()) {
++            // Block was locked by the preceding LockedRMWReadReq; re-enable
++            // access so the write can proceed normally.
++            assert(!blk->isSet(CacheBlk::WritableBit) &&
++                   !blk->isSet(CacheBlk::ReadableBit));
++            blk->setCoherenceBits(CacheBlk::ReadableBit);
++            blk->setCoherenceBits(CacheBlk::WritableBit);
++        } else {
++            // Block was evicted between LockedRMWRead and Write (e.g. during
++            // KVM→Timing CPU switch). Demote to a plain WriteReq so access()
++            // and handleTimingReqMiss handle it as a normal write miss.
++            // Atomicity is approximated for simulation purposes.
++            pkt->cmd = MemCmd::WriteReq;
++        }
+     }
+ 
+     Cycles lat;
+@@ -565,6 +574,17 @@ BaseCache::recvTimingResp(PacketPtr pkt)
+ 
+     // we have dealt with any (uncacheable) writes above, from here on
+     // we know we are dealing with an MSHR due to a miss or a prefetch
++
++    // Guard: a synthesized response from the bridge or a functional-path
++    // orphan may have no sender state.  Drop it — the MSHR (if any) will
++    // eventually be cleaned up by a later real response.
++    if (!pkt->senderState) {
++        DPRINTF(Cache, "recvTimingResp: dropping response with null "
++                "senderState for %s\n", pkt->print());
++        delete pkt;
++        return;
++    }
++
+     MSHR *mshr = dynamic_cast<MSHR*>(pkt->popSenderState());
+     assert(mshr);
+ 
+@@ -577,14 +597,21 @@ BaseCache::recvTimingResp(PacketPtr pkt)
+     // Initial target is used just for stats
+     const QueueEntry::Target *initial_tgt = mshr->getTarget();
+     const Tick miss_latency = curTick() - initial_tgt->recvTime;
+-    if (pkt->req->isUncacheable()) {
+-        assert(pkt->req->requestorId() < system->maxRequestors());
+-        stats.cmdStats(initial_tgt->pkt)
+-            .mshrUncacheableLatency[pkt->req->requestorId()] += miss_latency;
+-    } else {
+-        assert(pkt->req->requestorId() < system->maxRequestors());
+-        stats.cmdStats(initial_tgt->pkt)
+-            .mshrMissLatency[pkt->req->requestorId()] += miss_latency;
++    // Guard: initial_tgt->pkt may be a stale response (not a request) when
++    // the fresh_req path is taken.  cmdStats() indexes by command and is only
++    // valid for request commands; a response command causes an out-of-bounds
++    // access on the stats vector.  Skip stats in that rare edge case.
++    if (initial_tgt->pkt->isRequest()) {
++        if (pkt->req->isUncacheable()) {
++            assert(pkt->req->requestorId() < system->maxRequestors());
++            stats.cmdStats(initial_tgt->pkt)
++                .mshrUncacheableLatency[pkt->req->requestorId()] +=
++                miss_latency;
++        } else {
++            assert(pkt->req->requestorId() < system->maxRequestors());
++            stats.cmdStats(initial_tgt->pkt)
++                .mshrMissLatency[pkt->req->requestorId()] += miss_latency;
++        }
+     }
+ 
+     PacketList writebacks;
+@@ -1972,8 +1999,34 @@ BaseCache::sendMSHRQueuePacket(MSHR* mshr)
+         // not a cache block request, but a response is expected
+         // make copy of current packet to forward, keep current
+         // copy for response handling
+-        pkt = new Packet(tgt_pkt, false, true);
+-        assert(!pkt->isWrite());
++
++        if (!tgt_pkt->isRequest()) {
++            // Target was already answered (response arrived while send was
++            // queued for retry).  Always re-issue as a fresh ReadReq,
++            // regardless of whether the original was a read or write.
++            //
++            // Using ReadReq (never WriteReq) is critical:
++            //   – WriteResp travels via handleUncacheableWriteResp which
++            //     never pops the MSHR sender state, leaving the MSHR
++            //     in-service forever and causing a use-after-free segfault
++            //     when the MSHR is eventually recycled.
++            //   – ReadResp goes through recvTimingResp → popSenderState
++            //     → serviceMSHRTargets → proper MSHR deallocation.
++            //   – LockedRMWReadResp may not satisfy isRead(), so checking
++            //     tgt_pkt->isRead() to pick the command is unreliable.
++            // serviceMSHRTargets will see !tgt_pkt->isRequest() and
++            // break early without re-delivering to the CPU (the CPU already
++            // received and freed the packet in the previous cycle).
++            auto fresh_req = std::make_shared<Request>(
++                tgt_pkt->getAddr(), tgt_pkt->getSize(),
++                tgt_pkt->req->getFlags(),
++                tgt_pkt->req->requestorId());
++            pkt = new Packet(fresh_req, MemCmd::ReadReq, tgt_pkt->getSize());
++            pkt->allocate();
++        } else {
++            pkt = new Packet(tgt_pkt, false, true);
++            assert(!pkt->isWrite());
++        }
+     }
+ 
+     // play it safe and append (rather than set) the sender state,
+diff --git a/src/mem/cache/cache.cc b/src/mem/cache/cache.cc
+index bcf38da..03c5735 100644
+--- a/src/mem/cache/cache.cc
++++ b/src/mem/cache/cache.cc
+@@ -742,7 +742,7 @@ Cache::serviceMSHRTargets(MSHR *mshr, const PacketPtr pkt, CacheBlk *blk)
+ 
+             // Software prefetch handling for cache closest to core
+             if (tgt_pkt->cmd.isSWPrefetch()) {
+-                if (tgt_pkt->needsWritable()) {
++                if (tgt_pkt->isRequest() && tgt_pkt->needsWritable()) {
+                     // All other copies of the block were invalidated and we
+                     // have an exclusive copy.
+ 
+@@ -812,12 +812,15 @@ Cache::serviceMSHRTargets(MSHR *mshr, const PacketPtr pkt, CacheBlk *blk)
+                 completion_time += clockEdge(responseLatency) +
+                     (transfer_offset ? pkt->payloadDelay : 0);
+ 
+-                assert(!tgt_pkt->req->isUncacheable());
+-
+-                assert(tgt_pkt->req->requestorId() < system->maxRequestors());
+-                stats.cmdStats(tgt_pkt)
+-                    .missLatency[tgt_pkt->req->requestorId()] +=
+-                    completion_time - target.recvTime;
++                // Uncacheable targets (e.g. MMIO writes orphaned into an MSHR
++                // during KVM→TIMING switch) have no miss-latency to record.
++                if (!tgt_pkt->req->isUncacheable()) {
++                    assert(tgt_pkt->req->requestorId() <
++                           system->maxRequestors());
++                    stats.cmdStats(tgt_pkt)
++                        .missLatency[tgt_pkt->req->requestorId()] +=
++                        completion_time - target.recvTime;
++                }
+ 
+                 if (tgt_pkt->cmd == MemCmd::LockedRMWReadReq) {
+                     // We're going to leave a target in the MSHR until the
+@@ -866,20 +869,24 @@ Cache::serviceMSHRTargets(MSHR *mshr, const PacketPtr pkt, CacheBlk *blk)
+                 // from lower level caches/memory to the core.
+                 completion_time += clockEdge(responseLatency) +
+                     pkt->payloadDelay;
+-                if (!is_error) {
++                if (!is_error && tgt_pkt->isRequest()) {
+                     if (pkt->isRead()) {
+-                        // sanity check
+-                        assert(pkt->matchAddr(tgt_pkt));
+-                        assert(pkt->getSize() >= tgt_pkt->getSize());
+-
+-                        tgt_pkt->setData(pkt->getConstPtr<uint8_t>());
++                        if (pkt->matchAddr(tgt_pkt) &&
++                            pkt->getSize() >= tgt_pkt->getSize()) {
++                            tgt_pkt->setData(pkt->getConstPtr<uint8_t>());
++                        } else if (pkt->hasData() && tgt_pkt->hasData()) {
++                            // Address or size mismatch (e.g. fresh_req block
++                            // response vs byte-level target). Copy the
++                            // overlapping bytes so tgt_pkt always has valid
++                            // data for the CPU to read.
++                            std::memcpy(tgt_pkt->getPtr<uint8_t>(),
++                                        pkt->getConstPtr<uint8_t>(),
++                                        std::min(pkt->getSize(),
++                                                 tgt_pkt->getSize()));
++                        }
+                     } else {
+-                        // MSHR targets can read data either from the
+-                        // block or the response pkt. If we can't get data
+-                        // from the block (i.e., invalid or has old data)
+-                        // or the response (did not bring in any data)
+-                        // then make sure that the target didn't expect
+-                        // any.
++                        // Write response to a write target: target must not
++                        // already carry response data.
+                         assert(!tgt_pkt->hasRespData());
+                     }
+                 }
+@@ -887,20 +894,38 @@ Cache::serviceMSHRTargets(MSHR *mshr, const PacketPtr pkt, CacheBlk *blk)
+                 // this response did not allocate here and therefore
+                 // it was not consumed, make sure that any flags are
+                 // carried over to cache above
+-                tgt_pkt->copyResponderFlags(pkt);
++                if (tgt_pkt->isRequest())
++                    tgt_pkt->copyResponderFlags(pkt);
+             }
+-            tgt_pkt->makeTimingResponse();
+-            // if this packet is an error copy that to the new packet
+-            if (is_error)
+-                tgt_pkt->copyError(pkt);
+-            if (tgt_pkt->cmd == MemCmd::ReadResp &&
+-                (is_invalidate || mshr->hasPostInvalidate())) {
+-                // If intermediate cache got ReadRespWithInvalidate,
+-                // propagate that.  Response should not have
+-                // isInvalidate() set otherwise.
+-                tgt_pkt->cmd = MemCmd::ReadRespWithInvalidate;
+-                DPRINTF(Cache, "%s: updated cmd to %s\n", __func__,
+-                        tgt_pkt->print());
++            // Wrap in a block to avoid "jump to case label" C++ error.
++            {
++                const bool made_response = tgt_pkt->isRequest();
++                if (!made_response) {
++                    // tgt_pkt is already a response — the CPU previously
++                    // received and freed this packet.  Delivering it again
++                    // would be a use-after-free.  Silently discard: the
++                    // fresh_req response that triggered this call already
++                    // served as the round-trip to keep the MSHR alive long
++                    // enough to be cleaned up here.
++                    break;
++                }
++                if (!tgt_pkt->needsResponse()) {
++                    // No ACK needed (e.g. InvalidateReq, CleanEvict).
++                    break;
++                }
++                tgt_pkt->makeTimingResponse();
++                // if this packet is an error copy that to the new packet
++                if (is_error)
++                    tgt_pkt->copyError(pkt);
++                if (tgt_pkt->cmd == MemCmd::ReadResp &&
++                    (is_invalidate || mshr->hasPostInvalidate())) {
++                    // If intermediate cache got ReadRespWithInvalidate,
++                    // propagate that.  Response should not have
++                    // isInvalidate() set otherwise.
++                    tgt_pkt->cmd = MemCmd::ReadRespWithInvalidate;
++                    DPRINTF(Cache, "%s: updated cmd to %s\n", __func__,
++                            tgt_pkt->print());
++                }
+             }
+             // Reset the bus additional time as it is now accounted for
+             tgt_pkt->headerDelay = tgt_pkt->payloadDelay = 0;
+diff --git a/src/mem/cache/mshr.cc b/src/mem/cache/mshr.cc
+index 476408e..c423097 100644
+--- a/src/mem/cache/mshr.cc
++++ b/src/mem/cache/mshr.cc
+@@ -78,7 +78,11 @@ MSHR::TargetList::updateFlags(PacketPtr pkt, Target::Source source,
+                               bool alloc_on_fill)
+ {
+     if (source != Target::FromSnoop) {
+-        if (pkt->needsWritable()) {
++        // Guard isRequest(): a deferred target may occasionally be a
++        // response (e.g. a WritebackAck routed through a busy MSHR in
++        // multi-core timing mode).  Response packets are never writable
++        // requests, so skip the flag update safely.
++        if (pkt->isRequest() && pkt->needsWritable()) {
+             needsWritable = true;
+         }
+ 
+@@ -665,6 +669,9 @@ MSHR::promoteReadable()
+ 
+         auto pred = [](Target &t) {
+             assert(t.source == Target::FromCPU);
++            // Guard: a response packet in deferred targets is not a
++            // writable request; treat it as promotable (readable).
++            if (!t.pkt->isRequest()) return true;
+             return !t.pkt->req->isCacheInvalidate() &&
+                    !t.pkt->needsWritable();
+         };
+diff --git a/src/mem/coherent_xbar.cc b/src/mem/coherent_xbar.cc
+index 74ef1ea..1046c59 100644
+--- a/src/mem/coherent_xbar.cc
++++ b/src/mem/coherent_xbar.cc
+@@ -451,7 +451,16 @@ CoherentXBar::recvTimingResp(PacketPtr pkt, PortID mem_side_port_id)
+ 
+     // determine the destination
+     const auto route_lookup = routeTo.find(pkt->req);
+-    assert(route_lookup != routeTo.end());
++    if (route_lookup == routeTo.end()) {
++        // No route found — packet's req was never registered via a timing
++        // send through this xbar (e.g. an X86 IO device created a spurious
++        // request that the bridge converted to a response).  Drop it.
++        DPRINTF(CoherentXBar,
++                "%s: no routeTo entry for %s — dropping orphan response\n",
++                __func__, pkt->print());
++        delete pkt;
++        return true;
++    }
+     const PortID cpu_side_port_id = route_lookup->second;
+     assert(cpu_side_port_id != InvalidPortID);
+     assert(cpu_side_port_id < respLayers.size());
+diff --git a/src/python/gem5/components/boards/kernel_disk_workload.py b/src/python/gem5/components/boards/kernel_disk_workload.py
+index b737333..776daa1 100644
+--- a/src/python/gem5/components/boards/kernel_disk_workload.py
++++ b/src/python/gem5/components/boards/kernel_disk_workload.py
+@@ -284,7 +284,7 @@ class KernelDiskWorkload:
+         application_command = (
+             f'echo "{encodedBin}" | base64 -d > myapp\n'
+             "chmod +x myapp\n"
+-            f"./myapp {args}\n"
++            f"./myapp {' '.join(args)}\n"
+         )
+ 
+         self._set_readfile_contents(application_command)
+diff --git a/src/python/pybind11/event.cc b/src/python/pybind11/event.cc
+index 9c5fc67..e4d2b64 100644
+--- a/src/python/pybind11/event.cc
++++ b/src/python/pybind11/event.cc
+@@ -106,7 +106,8 @@ pybind_init_event(py::module_ &m_native)
+     py::module_ m = m_native.def_submodule("event");
+ 
+     m.def("simulate", &simulate,
+-          py::arg("ticks") = MaxTick);
++          py::arg("ticks") = MaxTick,
++          py::call_guard<py::gil_scoped_release>());
+     m.def("setMaxTick", &set_max_tick, py::arg("tick"));
+     m.def("getMaxTick", &get_max_tick, py::return_value_policy::copy);
+     m.def("terminateEventQueueThreads", &terminateEventQueueThreads);
+diff --git a/src/python/pybind11/stats.cc b/src/python/pybind11/stats.cc
+index 5083d62..ba50dd5 100644
+--- a/src/python/pybind11/stats.cc
++++ b/src/python/pybind11/stats.cc
+@@ -91,6 +91,7 @@ namespace statistics
+ void
+ pythonDump()
+ {
++    py::gil_scoped_acquire acquire;
+     py::module_ m = py::module_::import("m5.stats");
+     m.attr("dump")();
+ }
+@@ -98,6 +99,7 @@ pythonDump()
+ void
+ pythonReset()
+ {
++    py::gil_scoped_acquire acquire;
+     py::module_ m = py::module_::import("m5.stats");
+     m.attr("reset")();
+ }

@@ -1,0 +1,21 @@
+name: checks
+
+# On every push: recompute every figure the README and the paper quote from the committed
+# simulation logs, and confirm that patches/ reproduces every changed upstream file exactly.
+on:
+  push:
+  pull_request:
+
+jobs:
+  results:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Quoted figures reproduce from gem5/m5out
+        run: python tools/check_results.py
+      - name: patches/ matches the vendored upstream files
+        run: tools/check_patches.sh
