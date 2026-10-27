@@ -1,0 +1,259 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 64f360e..ed5faf8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1738,6 +1738,21 @@ if(WITH_BENCHMARK_TOOLS)
+   target_link_libraries(db_bench${ARTIFACT_SUFFIX}
+     ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
+ 
++  # PNM compaction unit: near-memory worker process (pins to core 1).
++  add_executable(pnm_compaction_unit
++    tools/pnm_unit_main.cc)
++  target_link_libraries(pnm_compaction_unit
++    ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
++
++  # rocksdb_pnm: main-CPU benchmark that offloads compaction to pnm_compaction_unit.
++  add_executable(rocksdb_pnm
++    tools/simulated_hybrid_file_system.cc
++    tools/db_bench_pnm_main.cc
++    tools/tool_hooks.cc
++    tools/db_bench_tool.cc)
++  target_link_libraries(rocksdb_pnm
++    ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
++
+   add_executable(cache_bench${ARTIFACT_SUFFIX}
+     cache/cache_bench.cc
+     cache/cache_bench_tool.cc)
+diff --git a/db/db_impl/db_impl_secondary.h b/db/db_impl/db_impl_secondary.h
+index e42f62b..a17fdae 100644
+--- a/db/db_impl/db_impl_secondary.h
++++ b/db/db_impl/db_impl_secondary.h
+@@ -297,14 +297,18 @@ class DBImplSecondary : public DBImpl {
+                          std::unordered_set<ColumnFamilyData*>* cfds_changed,
+                          JobContext* job_context);
+ 
++ public:
+   // Run compaction without installation, the output files will be placed in the
+   // secondary DB path. The LSM tree won't be changed, the secondary DB is still
+-  // in read-only mode.
++  // in read-only mode.  Made public to allow pnm_compaction_unit to call it
++  // directly on a persistent secondary instance (avoids per-job DB::Open cost).
+   Status CompactWithoutInstallation(const OpenAndCompactOptions& options,
+                                     ColumnFamilyHandle* cfh,
+                                     const CompactionServiceInput& input,
+                                     CompactionServiceResult* result);
+ 
++ private:
++
+  private:
+   // Holds results of compaction progress files and output files from a single
+   // directory scan
+diff --git a/tools/db_bench_tool.cc b/tools/db_bench_tool.cc
+index bfc40d6..a418b9d 100644
+--- a/tools/db_bench_tool.cc
++++ b/tools/db_bench_tool.cc
+@@ -15,7 +15,9 @@
+ #include <unistd.h>
+ #endif
+ #include <fcntl.h>
++#include <sys/mman.h>
+ #include <sys/types.h>
++#include "tools/pnm_compaction_service.h"
+ 
+ #include <cstdio>
+ #include <cstdlib>
+@@ -439,6 +441,19 @@ DEFINE_double(read_random_exp_range, 0.0,
+ 
+ DEFINE_bool(histogram, false, "Print histogram of operation timings");
+ 
++DEFINE_bool(pnm_offload, false,
++            "Offload compaction bandwidth to the PNM unit via /dev/pnm. "
++            "Fires on every OnCompactionCompleted event and submits the "
++            "actual input/output byte counts to the PNM device.");
++
++DEFINE_bool(pnm_true_offload, false,
++            "True PNM compaction offload: routes compactions to a dedicated "
++            "pnm_compaction_unit process via CompactionService. The PNM unit "
++            "compacts on a persistent secondary DB on core 1 while the main "
++            "process waits. "
++            "Requires pnm_compaction_unit to be running (rocksdb_pnm launches "
++            "it automatically).");
++
+ DEFINE_bool(confidence_interval_only, false,
+             "Print 95% confidence interval upper and lower bounds only for "
+             "aggregate stats.");
+@@ -3028,6 +3043,144 @@ class Benchmark {
+ 
+   std::shared_ptr<ErrorHandlerListener> listener_;
+ 
++  // ---------------------------------------------------------------------------
++  // Compaction event logger — active for both baseline and PNM runs
++  // ---------------------------------------------------------------------------
++  class CompactionLoggingListener : public EventListener {
++   public:
++    const char* Name() const override { return "CompactionLoggingListener"; }
++
++    void OnCompactionBegin(DB* /*db*/, const CompactionJobInfo& ci) override {
++      fprintf(stderr,
++              "[compaction] begin  job=%d L%d->L%d files_in=%zu\n",
++              ci.job_id, ci.base_input_level, ci.output_level,
++              ci.input_files.size());
++    }
++
++    void OnCompactionCompleted(DB* /*db*/,
++                               const CompactionJobInfo& ci) override {
++      fprintf(stderr,
++              "[compaction] done   job=%d L%d->L%d files_in=%zu files_out=%zu "
++              "src=%llu B dst=%llu B elapsed=%llu us\n",
++              ci.job_id, ci.base_input_level, ci.output_level,
++              ci.input_files.size(), ci.output_files.size(),
++              (unsigned long long)ci.stats.total_input_bytes,
++              (unsigned long long)ci.stats.total_output_bytes,
++              (unsigned long long)ci.stats.elapsed_micros);
++    }
++  };
++
++  std::shared_ptr<CompactionLoggingListener> compaction_log_listener_;
++
++  // ---------------------------------------------------------------------------
++  // PNM compaction offload listener
++  // ---------------------------------------------------------------------------
++  class PNMCompactionOffloadListener : public EventListener {
++   public:
++    // PNM MMIO constants — must match pnm_compactor.hh
++    static constexpr size_t   kPNMSize      = 0x100;
++    static constexpr uint32_t kOffSrcBytes  = 0x00;
++    static constexpr uint32_t kOffDstBytes  = 0x08;
++    static constexpr uint32_t kOffCmd       = 0x10;
++    static constexpr uint32_t kOffStatus    = 0x14;
++    static constexpr uint32_t kOffBytesProc = 0x18;
++    static constexpr uint32_t kOffJobsDone  = 0x20;
++    static constexpr uint32_t kCmdSubmit    = 1u;
++    static constexpr uint32_t kCmdReset     = 2u;
++    static constexpr uint32_t kStatusBusy   = (1u << 0);
++    static constexpr uint32_t kStatusDone   = (1u << 1);
++    static constexpr uint32_t kStatusError  = (1u << 2);
++
++    PNMCompactionOffloadListener() : fd_(-1), base_(nullptr) {
++      fd_ = open("/dev/pnm", O_RDWR | O_SYNC);
++      if (fd_ < 0) {
++        fprintf(stderr, "[pnm] /dev/pnm not available (%s) — "
++                "offload disabled\n", strerror(errno));
++        return;
++      }
++      base_ = static_cast<volatile uint8_t*>(
++          mmap(nullptr, kPNMSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0));
++      if (base_ == MAP_FAILED) {
++        fprintf(stderr, "[pnm] mmap failed (%s)\n", strerror(errno));
++        close(fd_);
++        fd_    = -1;
++        base_  = nullptr;
++        return;
++      }
++      fprintf(stderr, "[pnm] PNM offload listener ready\n");
++    }
++
++    ~PNMCompactionOffloadListener() override {
++      if (base_) munmap(const_cast<uint8_t*>(base_), kPNMSize);
++      if (fd_ >= 0) close(fd_);
++    }
++
++    const char* Name() const override { return "PNMCompactionOffloadListener"; }
++
++    void OnCompactionCompleted(DB* /*db*/,
++                               const CompactionJobInfo& ci) override {
++      if (!base_) return;
++
++      uint64_t src = ci.stats.total_input_bytes;
++      uint64_t dst = ci.stats.total_output_bytes;
++
++      // Diagnostic: log every compaction event regardless of stats
++      fprintf(stderr, "[pnm] OnCompactionCompleted: job=%d "
++              "stats.src=%llu stats.dst=%llu files_in=%zu files_out=%zu\n",
++              ci.job_id, (unsigned long long)src, (unsigned long long)dst,
++              ci.input_files.size(), ci.output_files.size());
++
++      // Fallback: if stats not populated, sum input file sizes via Env
++      if (src == 0) {
++        uint64_t fsize = 0;
++        auto* env = rocksdb::Env::Default();
++        for (const auto& f : ci.input_files) {
++          if (env->GetFileSize(f, &fsize).ok()) src += fsize;
++        }
++        dst = src / 2;  // estimate: ~50% of input after compression
++        fprintf(stderr, "[pnm] stats were 0, fallback: src=%llu dst=%llu\n",
++                (unsigned long long)src, (unsigned long long)dst);
++      }
++
++      if (src == 0) return;
++
++      // Diagnostic only — MMIO is handled by PNMCompactionService::Schedule().
++      fprintf(stderr,
++              "[pnm] compaction done: src=%llu B dst=%llu B "
++              "total=%llu B job=%d files_in=%zu files_out=%zu\n",
++              (unsigned long long)src, (unsigned long long)dst,
++              (unsigned long long)(src + dst), ci.job_id,
++              ci.input_files.size(), ci.output_files.size());
++    }
++
++   private:
++    int fd_;
++    volatile uint8_t* base_;
++
++    void w64(uint32_t off, uint64_t v) const {
++      __atomic_store_n(reinterpret_cast<volatile uint64_t*>(base_ + off),
++                       v, __ATOMIC_SEQ_CST);
++    }
++    void w32(uint32_t off, uint32_t v) const {
++      __atomic_store_n(reinterpret_cast<volatile uint32_t*>(base_ + off),
++                       v, __ATOMIC_SEQ_CST);
++    }
++    uint32_t r32(uint32_t off) const {
++      return __atomic_load_n(
++          reinterpret_cast<const volatile uint32_t*>(base_ + off),
++          __ATOMIC_SEQ_CST);
++    }
++    uint64_t r64(uint32_t off) const {
++      return __atomic_load_n(
++          reinterpret_cast<const volatile uint64_t*>(base_ + off),
++          __ATOMIC_SEQ_CST);
++    }
++  };
++
++  std::shared_ptr<PNMCompactionOffloadListener> pnm_listener_;
++  std::shared_ptr<PNMCompactionService> pnm_service_;
++  // ---------------------------------------------------------------------------
++
+   std::unique_ptr<TimestampEmulator> mock_app_clock_;
+ 
+   bool SanityCheck() {
+@@ -3534,6 +3687,13 @@ class Benchmark {
+     }
+ 
+     listener_.reset(new ErrorHandlerListener());
++    compaction_log_listener_ = std::make_shared<CompactionLoggingListener>();
++    if (FLAGS_pnm_offload) {
++      pnm_listener_ = std::make_shared<PNMCompactionOffloadListener>();
++    }
++    if (FLAGS_pnm_true_offload) {
++      pnm_service_ = std::make_shared<PNMCompactionService>();
++    }
+     if (user_timestamp_size_ > 0) {
+       mock_app_clock_.reset(new TimestampEmulator());
+     }
+@@ -5330,7 +5490,15 @@ class Benchmark {
+       }
+     }
+ 
++    options.listeners.clear();
+     options.listeners.emplace_back(listener_);
++    options.listeners.emplace_back(compaction_log_listener_);
++    if (pnm_listener_) {
++      options.listeners.emplace_back(pnm_listener_);
++    }
++    if (pnm_service_) {
++      options.compaction_service = pnm_service_;
++    }
+ 
+     if (options.file_checksum_gen_factory == nullptr) {
+       if (FLAGS_file_checksum) {

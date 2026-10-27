@@ -1,0 +1,21 @@
+# LF in the repository, checked out as OS-native
+* text=auto
+*.py     text
+*.md     text
+*.patch  text eol=lf
+*.pdf    binary
+
+# gem5/ and rocksdb/ are upstream trees kept byte-identical to upstream (see README, Provenance).
+# Upstream commits some files with CRLF or mixed line endings, and normalizing those would make a
+# fresh clone show them as modified, so no line-ending conversion applies inside the two trees.
+# These lines come last so that they override the rules above.
+gem5/**     -text
+rocksdb/**  -text
+
+# GitHub's language statistics: count the project's own files, not the vendored upstream trees.
+gem5/**                             linguist-vendored
+rocksdb/**                          linguist-vendored
+gem5/src/dev/pnm/**                 linguist-vendored=false
+gem5/configs/yonsei/**              linguist-vendored=false
+rocksdb/tools/pnm_*                 linguist-vendored=false
+rocksdb/tools/db_bench_pnm_main.cc  linguist-vendored=false
